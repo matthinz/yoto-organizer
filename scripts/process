@@ -1,0 +1,206 @@
+#!/usr/bin/env node
+
+// @ts-check
+
+require("dotenv").config();
+
+const {
+  extractAudioStream,
+  extractChapters,
+  findAudioFileChapters,
+  getAudioFileMetadata,
+  stripAudibleDRM,
+} = require("../lib/audio_file");
+
+const fs = require("fs");
+const path = require("path");
+
+const INBOX = "Inbox";
+const LIBRARY = "Cards";
+const DONE = "Done";
+
+/**
+ * @typedef {object} Chapter
+ * @property {number} start
+ * @property {number} end
+ * @property {string} title
+ */
+
+/**
+ * @typedef {object} Item
+ * @property {string} filename
+ * @property {string} [title]
+ * @property {Chapter[]} [chapters]
+ */
+
+/**
+ * @typedef {(item: Item) => Item | true | void} Handler
+ */
+
+/**
+ * @type {Handler[]}
+ */
+const HANDLERS = [
+  forExtensions(".aax", (item) => {
+    const { AUDIBLE_ACTIVATION_BYTES } = process.env;
+
+    if (!AUDIBLE_ACTIVATION_BYTES) {
+      console.error(
+        "Can't convert %s. You must set AUDIBLE_ACTIVATION_BYTES environment variable",
+      );
+      return;
+    }
+
+    const newFilename = stripAudibleDRM(
+      item.filename,
+      AUDIBLE_ACTIVATION_BYTES,
+    );
+
+    return {
+      ...item,
+      filename: newFilename,
+    };
+  }),
+
+  forExtensions(".webm", (item) => {
+    const audioFile = extractAudioStream(item.filename);
+
+    return {
+      ...item,
+      filename: audioFile,
+    };
+  }),
+
+  forExtensions([".m4a", ".m4b"], (item) => {
+    if (item.title != null) {
+      return;
+    }
+
+    const { title } = getAudioFileMetadata(item.filename);
+
+    return {
+      ...item,
+      title,
+    };
+  }),
+
+  forExtensions([".m4a", ".m4b"], (item) => {
+    if (item.chapters != null) {
+      return;
+    }
+
+    console.error("Searching for chapters: %s", item.filename);
+
+    const chapters = findAudioFileChapters(item.filename);
+
+    console.error("Found %d chapter(s)", chapters.length);
+
+    return {
+      ...item,
+      chapters,
+    };
+  }),
+
+  forExtensions([".m4a", ".m4b"], (item) => {
+    if (item.chapters == null || item.title == null) {
+      return;
+    }
+
+    let { title } = item;
+
+    const m = /(.+)[\/:] (.+)/.exec(title);
+    if (m) {
+      title = `${m[1]} (${m[2]})`;
+    }
+
+    title = title.replace(/[^'\(\)a-zA-Z0-9_ -]/g, "").trim();
+    const outputDirectory = path.join(LIBRARY, title);
+
+    console.error(
+      "Breaking into %d file(s) based on chapter",
+      item.chapters.length,
+    );
+
+    extractChapters(item.filename, item.chapters, outputDirectory);
+
+    return true;
+  }),
+];
+
+/**
+ * @type {Item[]}
+ */
+const items = process.argv.slice(2).map((i) => ({
+  filename: i,
+}));
+
+if (items.length === 0) {
+  fs.readdirSync(INBOX).forEach((item) => {
+    items.push({
+      filename: path.join(INBOX, item),
+    });
+  });
+}
+
+while (items.length) {
+  const item = items.shift();
+  if (!item) {
+    continue;
+  }
+
+  let handled = false;
+
+  console.error("Processing: %s", item.filename);
+
+  for (const h of HANDLERS) {
+    const nextItem = h(item);
+
+    if (nextItem === true) {
+      markFileDone(item.filename);
+      handled = true;
+      break;
+    }
+
+    if (nextItem) {
+      if (nextItem.filename !== item.filename) {
+        markFileDone(item.filename);
+      }
+
+      items.push(nextItem);
+      handled = true;
+      break;
+    }
+  }
+
+  if (!handled) {
+    console.error("Ignoring %s", item.filename);
+  }
+}
+
+/**
+ *
+ * @param ext {string|string[]}
+ * @param handler {Handler}
+ * @returns {Handler}
+ */
+function forExtensions(exts, handler) {
+  const extensionsArray = Array.isArray(exts) ? [...exts] : [exts];
+
+  return (item) => {
+    if (!extensionsArray.includes(path.extname(item.filename))) {
+      return;
+    }
+
+    return handler(item);
+  };
+}
+
+/**
+ * @param filename {string}
+ */
+function markFileDone(filename) {
+  const basename = path.basename(filename);
+  const doneFileName = path.join(DONE, basename);
+  fs.mkdirSync(path.dirname(doneFileName), { recursive: true });
+  fs.renameSync(filename, doneFileName);
+}

@@ -1,0 +1,16 @@
+*.aac
+*.m4a
+*.m4b
+*.mp3
+*.webm
+*.zip
+
+node_modules
+
+/Cards
+/Inbox
+/Done
+
+.env
+
+.DS_Store
