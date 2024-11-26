@@ -11,8 +11,8 @@ const {
   stripAudibleDRM,
   getAudioFileMetadata,
 } = require("../lib/audio_file");
-const { disambiguateBookTitle } = require("../lib/llm");
-const { sanitizeFilename, zeroPad } = require("../lib/utils");
+const { disambiguateBookTitle, shortenBookTitle } = require("../lib/llm");
+const { sanitizeFilename, zeroPad, createCachedMap } = require("../lib/utils");
 
 const fs = require("fs");
 const path = require("path");
@@ -54,7 +54,7 @@ const HANDLERS = [
   detectLibroFMFiles,
   detectAndRemoveAudibleDRM(process.env["AUDIBLE_ACTIVATION_BYTES"]),
   extractAudioStreamFromVideos,
-  findBookTitle(),
+  findBookTitle,
   findChapters,
   createNewFilesFromChapters,
   moveFilesIntoLibraryWhenFinished,
@@ -272,93 +272,66 @@ function extractAudioStreamFromVideos(item) {
 }
 
 /**
- * @returns {Handler}
+ * @param {Item} item
+ * @returns {Item|void}
  */
-function findBookTitle() {
-  /**
-   * @type {Map<string,string>}
-   */
-  const titlesByLibroFMBase = new Map();
+function findBookTitle(item) {
+  if (item.bookTitle != null) {
+    return;
+  }
 
-  const CACHE_FILE = path.join(INBOX, ".titles_cache.json");
+  const libroFMBaseToTitleMap = createCachedMap(
+    path.join(INBOX, ".titles_cache.json"),
+  );
 
-  const getTitleByLibroFMBase = (base) => {
-    if (titlesByLibroFMBase.size === 0) {
-      try {
-        const text = fs.readFileSync(path.join(INBOX, ".titles.json"), "utf-8");
-        const json = JSON.parse(text);
-        json.forEach(([key, value]) => {
-          titlesByLibroFMBase.set(key, value);
-        });
-      } catch {}
+  if (item.libroFmBase) {
+    // If you have a large number of files, an LLM may give slightly different
+    // book title guesses for each one. Here we check if we've already
+    // asked about another Libro.fm file and use that.
+    let bookTitle = libroFMBaseToTitleMap.get(item.libroFmBase);
+
+    if (bookTitle != null) {
+      return {
+        ...item,
+        bookTitle,
+      };
     }
-    return titlesByLibroFMBase.get(base);
-  };
+  }
 
-  const saveTitleByLibroFMBase = (base, title) => {
-    titlesByLibroFMBase.set(base, title);
-    try {
-      fs.writeFileSync(
-        CACHE_FILE,
-        JSON.stringify(Array.from(titlesByLibroFMBase.entries()), null, 2),
-      );
-    } catch {}
-  };
+  const { title, album } = getAudioFileMetadata(item.filename);
+  let candidates;
 
-  return (item) => {
-    if (item.bookTitle != null) {
-      return;
-    }
+  console.error(
+    "  Finding book title for %s (title: %s, album: %s)",
+    item.filename,
+    title,
+    album,
+  );
 
-    if (item.libroFmBase) {
-      // If you have a large number of files, an LLM may give slightly different
-      // book title guesses for each one. Here we check if we've already
-      // asked about another Libro.fm file and use that.
-      let bookTitle = getTitleByLibroFMBase(item.libroFmBase);
+  if (item.chapter) {
+    // This is a chapter of another book. The album will *probably*
+    // be the book title.
 
-      if (bookTitle != null) {
-        return {
-          ...item,
-          bookTitle,
-        };
-      }
-    }
+    candidates = [album, title].filter((s) => s && s.length > 0);
+  } else {
+    candidates = [title, album];
+  }
 
-    const { title, album } = getAudioFileMetadata(item.filename);
-    let candidates;
+  let bookTitle;
 
-    console.error(
-      "  Finding book title for %s (title: %s, album: %s)",
-      item.filename,
-      title,
-      album,
-    );
+  if (candidates.length === 1) {
+    bookTitle = candidates[0];
+  } else {
+    bookTitle = disambiguateBookTitle(item.filename, candidates);
+  }
 
-    if (item.chapter) {
-      // This is a chapter of another book. The album will *probably*
-      // be the book title.
+  console.error('  Got "%s"', bookTitle);
 
-      candidates = [album, title].filter((s) => s && s.length > 0);
-    } else {
-      candidates = [title, album];
-    }
+  if (item.libroFmBase) {
+    libroFMBaseToTitleMap.set(item.libroFmBase, bookTitle);
+  }
 
-    let bookTitle;
-
-    if (candidates.length === 1) {
-      bookTitle = candidates[0];
-    } else {
-      bookTitle = disambiguateBookTitle(item.filename, candidates);
-    }
-
-    console.error('  Got "%s"', bookTitle);
-
-    if (item.libroFmBase) {
-      saveTitleByLibroFMBase(item.libroFmBase, bookTitle);
-    }
-
-    return { ...item, bookTitle };
-  };
+  return { ...item, bookTitle };
 }
 
 /**
@@ -446,10 +419,18 @@ function moveFilesIntoLibraryWhenFinished(item) {
     return;
   }
 
+  const shortTitleMap = createCachedMap(path.join(INBOX, ".short_titles.json"));
+
+  let shortTitle = shortTitleMap.get(bookTitle);
+  if (shortTitle == null) {
+    shortTitle = shortenBookTitle(bookTitle);
+    shortTitleMap.set(bookTitle, shortTitle);
+  }
+
   const paddedChapter = zeroPad(chapter, numberOfDigitsNeededForChapters);
 
   // Now we generate a new filename
-  const directoryName = sanitizeFilename(bookTitle);
+  const directoryName = sanitizeFilename(shortTitle);
 
   let baseFilename;
   if (chapter && chapterTitle && chapterTitle !== `Chapter ${chapter}`) {
