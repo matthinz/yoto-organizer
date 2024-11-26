@@ -8,16 +8,22 @@ const {
   extractAudioStream,
   extractChapters,
   findAudioFileChapters,
-  getAudioFileMetadata,
   stripAudibleDRM,
+  getAudioFileMetadata,
 } = require("../lib/audio_file");
+const { disambiguateBookTitle } = require("../lib/llm");
+const { sanitizeFilename, zeroPad } = require("../lib/utils");
 
 const fs = require("fs");
 const path = require("path");
 
-const INBOX = "Inbox";
-const LIBRARY = "Cards";
+const INBOX = process.env["INBOX"] ?? "Inbox";
+const LIBRARY = process.env["LIBRARY"] ?? "Cards";
 const DONE = "Done";
+
+const DRY_RUN = !!process.env["DRY_RUN"];
+
+const VALID_EXTENSIONS = [".mp3", ".aac", ".m4a", ".m4b", ".webm"];
 
 /**
  * @typedef {object} Chapter
@@ -29,169 +35,367 @@ const DONE = "Done";
 /**
  * @typedef {object} Item
  * @property {string} filename
- * @property {string} [title]
+ * @property {string} [bookTitle]
  * @property {Chapter[]} [chapters]
+ * @property {number} [chapter]
+ * @property {number} [numberOfDigitsNeededForChapters]
+ * @property {string} [chapterTitle]
+ * @property {string} [libroFmBase]
  */
 
 /**
- * @typedef {(item: Item) => Item | true | void} Handler
+ * @typedef {(item: Item) => Item | Item[] | true | void} Handler
  */
 
 /**
  * @type {Handler[]}
  */
 const HANDLERS = [
-  forExtensions(".aax", (item) => {
-    const { AUDIBLE_ACTIVATION_BYTES } = process.env;
+  detectLibroFMFiles,
+  detectAndRemoveAudibleDRM(process.env["AUDIBLE_ACTIVATION_BYTES"]),
+  extractAudioStreamFromVideos,
+  findBookTitle(),
+  findChapters,
+  createNewFilesFromChapters,
+  moveFilesIntoLibraryWhenFinished,
+];
 
-    if (!AUDIBLE_ACTIVATION_BYTES) {
+let filenames = process.argv.slice(2);
+if (filenames.length === 0) {
+  filenames = fs
+    .readdirSync(INBOX)
+    .filter((f) => VALID_EXTENSIONS.includes(path.extname(f)))
+    .map((f) => path.join(INBOX, f));
+}
+
+/**
+ * @type {Item[]}
+ */
+let items = filenames.map((filename, index) => ({
+  filename,
+}));
+
+while (true) {
+  items = processItems(items);
+
+  if (items.length === 0) {
+    break;
+  }
+
+  if (DRY_RUN) {
+    break;
+  }
+}
+
+/**
+ * @param items {Item[]}
+ * @return {Item[]}
+ */
+function processItems(items) {
+  /** @type {Item[]} */
+  const unhandled = [];
+
+  while (items.length) {
+    const item = items.shift();
+    if (!item) {
+      continue;
+    }
+
+    let handled = false;
+
+    console.error("Processing: %s", item.filename);
+
+    for (const h of HANDLERS) {
+      const nextItem = h(item);
+
+      if (nextItem === true) {
+        // This item was completely processed and no more items are needed.
+        markFileDone(item.filename);
+        handled = true;
+        break;
+      }
+
+      if (Array.isArray(nextItem)) {
+        markFileDone(item.filename);
+        nextItem.forEach((i) => items.push(i));
+        handled = true;
+        break;
+      }
+
+      if (nextItem) {
+        if (nextItem.filename !== item.filename) {
+          markFileDone(item.filename);
+        }
+        items.push(nextItem);
+        handled = true;
+        break;
+      }
+    }
+
+    if (!handled) {
+      unhandled.push(item);
+    }
+  }
+
+  return unhandled;
+}
+
+/**
+ *
+ * @param item {Item}
+ * @returns {Item[]|void}
+ */
+function createNewFilesFromChapters(item) {
+  const { bookTitle, chapters, filename } = item;
+
+  if (chapters == null || bookTitle == null) {
+    return;
+  }
+
+  console.error(
+    "  Breaking into %d file(s) based on chapters",
+    chapters.length,
+  );
+
+  if (DRY_RUN) {
+    chapters.forEach((c, index) => {
+      console.error(`  ${index + 1}. ${c.title}`);
+    });
+    return;
+  }
+
+  const filenames = extractChapters({
+    filename,
+    bookTitle,
+    chapters,
+    outputDirectory: path.dirname(filename),
+  });
+
+  return filenames.map((filename, index) => ({
+    filename,
+    bookTitle,
+    chapter: index + 1,
+    numberOfDigitsNeededForChapters: String(filenames.length).length,
+  }));
+}
+
+/**
+ *
+ * @param item {Item}
+ * @returns {Item|void}
+ */
+function detectLibroFMFiles(item) {
+  // Libro.fm files are broken up by chapter, with each file ending with
+  // something like ' - Track XXX'
+
+  const ext = path.extname(item.filename);
+  const base = path.basename(item.filename, ext);
+
+  const m = /(.+) - Track (0*(\d*))$/.exec(base);
+  if (!m) {
+    return;
+  }
+
+  if (item.libroFmBase) {
+    return;
+  }
+
+  const libroFmBase = m[1];
+  const chapter = parseInt(m[3], 10);
+  const numberOfDigitsNeededForChapters = m[2].length;
+
+  console.error("  Looks like libro.fm file (base: %s)", libroFmBase);
+  console.error("  chapter: %d", chapter);
+
+  return {
+    ...item,
+    libroFmBase,
+    chapter,
+    numberOfDigitsNeededForChapters,
+    chapterTitle: `Chapter ${chapter}`,
+  };
+}
+
+/**
+ * @param activationBytes {string|undefined}
+ * @returns {Handler}
+ */
+function detectAndRemoveAudibleDRM(activationBytes) {
+  return (item) => {
+    const ext = path.extname(item.filename);
+
+    if (ext !== ".aax") {
+      return;
+    }
+
+    activationBytes = (activationBytes ?? "").trim();
+    if (activationBytes.length === 0) {
       console.error(
         "Can't convert %s. You must set AUDIBLE_ACTIVATION_BYTES environment variable",
+        item.filename,
       );
       return;
     }
 
-    const newFilename = stripAudibleDRM(
-      item.filename,
-      AUDIBLE_ACTIVATION_BYTES,
-    );
+    const newFilename = stripAudibleDRM(item.filename, activationBytes);
 
     return {
       ...item,
       filename: newFilename,
     };
-  }),
-
-  forExtensions(".webm", (item) => {
-    const audioFile = extractAudioStream(item.filename);
-
-    return {
-      ...item,
-      filename: audioFile,
-    };
-  }),
-
-  forExtensions([".m4a", ".m4b"], (item) => {
-    if (item.title != null) {
-      return;
-    }
-
-    const { title } = getAudioFileMetadata(item.filename);
-
-    return {
-      ...item,
-      title,
-    };
-  }),
-
-  forExtensions([".m4a", ".m4b"], (item) => {
-    if (item.chapters != null) {
-      return;
-    }
-
-    console.error("Searching for chapters: %s", item.filename);
-
-    const chapters = findAudioFileChapters(item.filename);
-
-    console.error("Found %d chapter(s)", chapters.length);
-
-    return {
-      ...item,
-      chapters,
-    };
-  }),
-
-  forExtensions([".m4a", ".m4b"], (item) => {
-    if (item.chapters == null || item.title == null) {
-      return;
-    }
-
-    let { title } = item;
-
-    const m = /(.+)[\/:] (.+)/.exec(title);
-    if (m) {
-      title = `${m[1]} (${m[2]})`;
-    }
-
-    title = title.replace(/[^'\(\)a-zA-Z0-9_ -]/g, "").trim();
-    const outputDirectory = path.join(LIBRARY, title);
-
-    console.error(
-      "Breaking into %d file(s) based on chapter",
-      item.chapters.length,
-    );
-
-    extractChapters(item.filename, item.chapters, outputDirectory);
-
-    return true;
-  }),
-];
-
-/**
- * @type {Item[]}
- */
-const items = process.argv.slice(2).map((i) => ({
-  filename: i,
-}));
-
-if (items.length === 0) {
-  fs.readdirSync(INBOX).forEach((item) => {
-    items.push({
-      filename: path.join(INBOX, item),
-    });
-  });
-}
-
-while (items.length) {
-  const item = items.shift();
-  if (!item) {
-    continue;
-  }
-
-  let handled = false;
-
-  console.error("Processing: %s", item.filename);
-
-  for (const h of HANDLERS) {
-    const nextItem = h(item);
-
-    if (nextItem === true) {
-      markFileDone(item.filename);
-      handled = true;
-      break;
-    }
-
-    if (nextItem) {
-      if (nextItem.filename !== item.filename) {
-        markFileDone(item.filename);
-      }
-
-      items.push(nextItem);
-      handled = true;
-      break;
-    }
-  }
-
-  if (!handled) {
-    console.error("Ignoring %s", item.filename);
-  }
+  };
 }
 
 /**
  *
- * @param ext {string|string[]}
- * @param handler {Handler}
+ * @param item {Item}
+ * @returns {Item|void|true}
+ */
+function extractAudioStreamFromVideos(item) {
+  const ext = path.extname(item.filename);
+
+  // yt-dlp generates .webm files
+  if (ext !== ".webm") {
+    return;
+  }
+
+  if (DRY_RUN) {
+    return true;
+  }
+
+  const audioFile = extractAudioStream(item.filename);
+
+  return {
+    ...item,
+    filename: audioFile,
+  };
+}
+
+/**
  * @returns {Handler}
  */
-function forExtensions(exts, handler) {
-  const extensionsArray = Array.isArray(exts) ? [...exts] : [exts];
+function findBookTitle() {
+  /**
+   * @type {Map<string,string>}
+   */
+  const titlesByLibroFMBase = new Map();
+
+  const CACHE_FILE = path.join(INBOX, ".titles_cache.json");
+
+  const getTitleByLibroFMBase = (base) => {
+    if (titlesByLibroFMBase.size === 0) {
+      try {
+        const text = fs.readFileSync(path.join(INBOX, ".titles.json"), "utf-8");
+        const json = JSON.parse(text);
+        json.forEach(([key, value]) => {
+          titlesByLibroFMBase.set(key, value);
+        });
+      } catch {}
+    }
+    return titlesByLibroFMBase.get(base);
+  };
+
+  const saveTitleByLibroFMBase = (base, title) => {
+    titlesByLibroFMBase.set(base, title);
+    try {
+      fs.writeFileSync(
+        CACHE_FILE,
+        JSON.stringify(Array.from(titlesByLibroFMBase.entries()), null, 2),
+      );
+    } catch {}
+  };
 
   return (item) => {
-    if (!extensionsArray.includes(path.extname(item.filename))) {
+    if (item.bookTitle != null) {
       return;
     }
 
-    return handler(item);
+    if (item.libroFmBase) {
+      // If you have a large number of files, an LLM may give slightly different
+      // book title guesses for each one. Here we check if we've already
+      // asked about another Libro.fm file and use that.
+      let bookTitle = getTitleByLibroFMBase(item.libroFmBase);
+
+      if (bookTitle != null) {
+        return {
+          ...item,
+          bookTitle,
+        };
+      }
+    }
+
+    const { title, album } = getAudioFileMetadata(item.filename);
+    let candidates;
+
+    console.error(
+      "  Finding book title for %s (title: %s, album: %s)",
+      item.filename,
+      title,
+      album,
+    );
+
+    if (item.chapter) {
+      // This is a chapter of another book. The album will *probably*
+      // be the book title.
+
+      candidates = [album, title].filter((s) => s && s.length > 0);
+    } else {
+      candidates = [title, album];
+    }
+
+    let bookTitle;
+
+    if (candidates.length === 1) {
+      bookTitle = candidates[0];
+    } else {
+      bookTitle = disambiguateBookTitle(item.filename, candidates);
+    }
+
+    console.error('  Got "%s"', bookTitle);
+
+    if (item.libroFmBase) {
+      saveTitleByLibroFMBase(item.libroFmBase, bookTitle);
+    }
+
+    return { ...item, bookTitle };
+  };
+}
+
+/**
+ *
+ * @param item {Item}
+ * @returns {Item|undefined}
+ */
+function findChapters(item) {
+  const ext = path.extname(item.filename);
+
+  // Apple uses the extension .m4b to indicate an audiobook.
+  // It's actually an .m4a file, but the different extension marks it as a book
+
+  if (ext !== ".m4a" && ext !== ".m4b") {
+    return;
+  }
+
+  if (item.chapters != null) {
+    return;
+  }
+
+  const { chapter, chapterTitle } = item;
+
+  if (chapter) {
+    // This file is already augmented with chapter data, so let's assume
+    // it does not itself contain chapters
+    return;
+  }
+
+  const chapters = findAudioFileChapters(item.filename);
+
+  console.error("  Found %d chapter(s)", chapters.length);
+
+  return {
+    ...item,
+    chapters,
+    numberOfDigitsNeededForChapters: String(chapters.length).length,
   };
 }
 
@@ -199,8 +403,72 @@ function forExtensions(exts, handler) {
  * @param filename {string}
  */
 function markFileDone(filename) {
+  if (DRY_RUN) {
+    console.error("  DONE");
+    return;
+  }
+
+  console.error("  DONE. Move to %s", DONE);
+
   const basename = path.basename(filename);
   const doneFileName = path.join(DONE, basename);
   fs.mkdirSync(path.dirname(doneFileName), { recursive: true });
   fs.renameSync(filename, doneFileName);
+}
+
+/**
+ * @param item {Item}
+ * @returns {void|true}
+ */
+function moveFilesIntoLibraryWhenFinished(item) {
+  const {
+    bookTitle,
+    chapter,
+    numberOfDigitsNeededForChapters,
+    chapters,
+    chapterTitle,
+  } = item;
+
+  if (chapters) {
+    // still need to break into chapters
+    return;
+  }
+
+  if (chapter == null || numberOfDigitsNeededForChapters == null) {
+    // still need to augment with chapter #
+    console.error("%s: still need chapter", item.filename);
+    return;
+  }
+
+  if (bookTitle == null) {
+    // Still need to discover book title
+    console.error("%s: still need title", item.filename);
+    return;
+  }
+
+  const paddedChapter = zeroPad(chapter, numberOfDigitsNeededForChapters);
+
+  // Now we generate a new filename
+  const directoryName = sanitizeFilename(bookTitle);
+
+  let baseFilename;
+  if (chapter && chapterTitle && chapterTitle !== `Chapter ${chapter}`) {
+    baseFilename = `Chapter ${paddedChapter} - ${chapterTitle}`;
+  } else {
+    baseFilename = `Chapter ${paddedChapter}`;
+  }
+
+  baseFilename = sanitizeFilename(baseFilename);
+
+  const ext = path.extname(item.filename);
+
+  const destFilename = path.join(directoryName, `${baseFilename}${ext}`);
+  const destFilenameInLibrary = path.join(LIBRARY, destFilename);
+
+  console.error("  Move into Library: %s", destFilename);
+
+  fs.mkdirSync(path.dirname(destFilenameInLibrary), { recursive: true });
+  fs.cpSync(item.filename, destFilenameInLibrary);
+
+  return true;
 }
