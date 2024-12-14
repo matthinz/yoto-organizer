@@ -7,9 +7,11 @@
 
 node_modules
 
+/art
 /Cards
-/Inbox
 /Done
+/Inbox
+/Inbox.backup
 
 .env
 
